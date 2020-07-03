@@ -34,15 +34,31 @@ def get_url_from_section(url):
         r = requests.get(url, params={
             "page": p
         }).text
+        soup = BeautifulSoup(r, 'html5lib')
         urls = soup.find_all("a", {"class": "bulletinLink bull-item__self-link auto-shy"})
         urls = ["https://www.farpost.ru" + u['href'] for u in urls]
+        urls = list(filter(lambda x: "html" in x, urls))
 
-        soup = BeautifulSoup(r, 'html5lib')
         res += urls
     return list(set(res))
 
 
-@bot.message_handler(commands=['start', 'status', 'restart'])
+def update_tasks():
+    urls = []
+    for tag in ["rent_business_realty", "sell_business_realty", "sell_flats"]:
+        urs = get_url_from_section(f"https://www.farpost.ru/vladivostok/realty/{tag}/")
+        urls += urs
+        tasks = [{
+            "url": u,
+            "tag": tag
+        } for u in urs]
+        Tasks.insert_many(tasks).on_conflict_ignore().execute()
+        print(tag, ":done")
+
+    Items.update({Items.deleted: True}).where(Items.url.not_in(urls))
+
+
+@bot.message_handler(commands=['start', 'status', 'parser_begin'])
 def start(message):
     print("New commands:", message.text)
     if message.text == "/start":
@@ -50,36 +66,31 @@ def start(message):
 
     elif message.text == "/status":
         done = Tasks.select().where(Tasks.done == True).count()
-        all = Tasks.select().count() + 1
-        progress = int((done / all) * 40)
-        percent = int((done / all) * 100)
-        mes = f"Done: {percent}% ({done}/{all})\n\n|" + "=" * progress + ">" + "_" * (40 - progress)+"|"
+        all = Tasks.select().count()
+        if all == 0:
+            bot.send_message(message.chat.id, "Идет сбор сслылок на объявления...")
+            return
+
+        progress = round((done / all) * 30)
+        percent = round((done / all) * 100)
+        mes = f"Done: {percent}% ({done}/{all})\n\n[" + "=" * progress + (">" if percent < 100 else "") + "_" * (
+                30 - progress) + "]"
         bot.send_message(message.chat.id, mes)
 
-    elif message.text == "/restart":
-        if Tasks.select().where(Tasks.done == False).count() > 0:
+    elif message.text == "/parser_begin":
+        if Tasks.select().where(Tasks.done == False).count() > 10:
             bot.send_message(message.chat.id, "Дождитесь окончания тякущего сеанса парсера")
             return
 
         Tasks.delete().execute()
+        update_tasks()
         bot.send_message(message.chat.id,
                          "Запущен парсинг, для отслеживания состояния парсера отправьте команду /status")
-        urls = []
-        for tag in ["rent_business_realty", "sell_business_realty", "sell_flats"]:
-            urs = get_url_from_section(f"https://www.farpost.ru/vladivostok/realty/{tag}/")
-            urls += urs
-            tasks = [{
-                "url": u,
-                "tag": tag
-            } for u in urs]
-            Tasks.insert_many(tasks).on_conflict_ignore().execute()
-            print(tag, ":done")
-
-        Items.update({Items.deleted: True}).where(Items.url.not_in(urls))
 
 
 @bot.message_handler(content_types=['text'])
 def text(message):
+    print(message.text)
     if message.text == BOT_PASS:
         bot.send_message(message.chat.id,
                          "Бот активирован",
@@ -94,18 +105,19 @@ def text(message):
         tag = "sell_flats"
     else:
         return
+    bot.send_message(message.chat.id,
+                     "Начали готовить для вас файлы")
 
-    items = Items.select().where(Items.tag == tag).execute()
+    items = Items.select().where((Items.tag == tag) & (Items.deleted == False)).execute()
     print(f"For sended {tag}: {len(items)}")
     items = [model_to_dict(i) for i in items]
-    data = []
 
     def preparing_data(i):
         return {
             "ссылка на объявление": i['url'],
             "текст объявления": i['about'],
             "дата размещения": i['date'],
-            "контакты": i['saller_contacts'],
+            "контакты": i['saller_contacts'] if i['saller_contacts'][0] != '\n' else i['saller_contacts'][1:],
             "логин разместившего": i['saller_login'],
             "предложение": i['is_agency'],
             "компания": i['company'],
@@ -116,22 +128,24 @@ def text(message):
         from collections import defaultdict
         data_by_tags = defaultdict(list)
         for i in items:
-            data_by_tags[i.subpart].append(preparing_data(i))
+            if i['subpart'] != "":
+                data_by_tags[i['subpart']].append(preparing_data(i))
 
-        for key in data_by_tags.keys():
-            doc = pd.DataFrame.from_dict(data_by_tags[key])
-            doc.to_excel(f"{key}.xlsx")
-            with open(f"{key}.xlsx", "rb") as f:
-                bot.send_document(message.chat.id, f, caption=f"Выкаченные объявления ({len(data)})")
+        with pd.ExcelWriter('data.xlsx', mode='w') as writer:
+            for key in data_by_tags.keys():
+                doc = pd.DataFrame.from_dict(data_by_tags[key])
+                doc.to_excel(writer, sheet_name=key)
     else:
         data = []
         for i in items:
             data.append(preparing_data(i))
         doc = pd.DataFrame.from_dict(data)
         doc.to_excel("data.xlsx")
-        with open("data.xlsx", "rb") as f:
-            bot.send_document(message.chat.id, f, caption=f"Выкаченные объявления ({len(data)})")
+
+    with open("data.xlsx", "rb") as f:
+        bot.send_document(message.chat.id, f, caption=f"Выкаченные объявления ({len(items)})")
 
 
-print("Start")
-bot.polling(none_stop=True, timeout=60)
+if __name__ == "__main__":
+    print("Start")
+    bot.polling(none_stop=True, timeout=60)
